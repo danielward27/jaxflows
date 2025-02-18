@@ -1,6 +1,7 @@
 """Training loops."""
 
 from collections.abc import Callable
+from warnings import warn
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -28,6 +29,8 @@ def fit_to_key_based_loss(
     learning_rate: float = 5e-4,
     optimizer: optax.GradientTransformation | None = None,
     show_progress: bool = True,
+    opt_state: optax.OptState | None = None,
+    return_opt_state: bool = False,
 ):
     """Train a pytree, using a loss with params, static and key as arguments.
 
@@ -43,6 +46,8 @@ def fit_to_key_based_loss(
         learning_rate: The adam learning rate. Ignored if optimizer is provided.
         optimizer: Optax optimizer. Defaults to None.
         show_progress: Whether to show progress bar. Defaults to True.
+        opt_state: Optinal initial state of the optimizer.
+        return_opt_state: Whether to return the optimizer state.
 
     Returns:
         A tuple containing the trained pytree and the losses.
@@ -55,7 +60,8 @@ def fit_to_key_based_loss(
         eqx.is_inexact_array,
         is_leaf=lambda leaf: isinstance(leaf, paramax.NonTrainable),
     )
-    opt_state = optimizer.init(params)
+    if opt_state is None:
+        opt_state = optimizer.init(params)
 
     losses = []
 
@@ -72,14 +78,15 @@ def fit_to_key_based_loss(
         )
         losses.append(loss.item())
         keys.set_postfix({"loss": loss.item()})
+    if return_opt_state:
+        return eqx.combine(params, static), losses, opt_state
     return eqx.combine(params, static), losses
 
 
 def fit_to_data(
     key: PRNGKeyArray,
     dist: PyTree,  # Custom losses may support broader types than AbstractDistribution
-    x: ArrayLike,
-    *,
+    *data: ArrayLike,
     condition: ArrayLike | None = None,
     loss_fn: Callable | None = None,
     learning_rate: float = 5e-4,
@@ -90,6 +97,8 @@ def fit_to_data(
     val_prop: float = 0.1,
     return_best: bool = True,
     show_progress: bool = True,
+    opt_state: optax.OptState | None = None,
+    return_opt_state: bool = False,
 ):
     r"""Train a PyTree (e.g. a distribution) to samples from the target.
 
@@ -101,11 +110,14 @@ def fit_to_data(
     Args:
         key: Jax random seed.
         dist: The pytree to train (usually a distribution).
-        x: Samples from target distribution.
+        data: Samples from target distribution. If several arrays are passed, each one
+            is split into batches along the first axes, and one batch of each is
+            passed into the loss function.
         learning_rate: The learning rate for adam optimizer. Ignored if optimizer is
             provided.
         optimizer: Optax optimizer. Defaults to None.
-        condition: Conditioning variables. Defaults to None.
+        condition: Conditioning variables. Defaults to None. This argument is
+            deprecated, you can pass this information as the last `x` argument.
         loss_fn: Loss function. Defaults to MaximumLikelihoodLoss.
         max_epochs: Maximum number of epochs. Defaults to 100.
         max_patience: Number of consecutive epochs with no validation loss improvement
@@ -116,11 +128,22 @@ def fit_to_data(
             was reached (when True), or the parameters after the last update (when
             False). Defaults to True.
         show_progress: Whether to show progress bar. Defaults to True.
+        opt_state: Optinal initial state of the optimizer.
+        return_opt_state: Whether to return the optimizer state.
 
     Returns:
-        A tuple containing the trained distribution and the losses.
+        A tuple containing the trained distribution and a dict with optimization
+        information like the losses and the optimizer state.
+
+        If an opt_state is provided, it will also return the new opt_state.
     """
-    data = (x,) if condition is None else (x, condition)
+    if condition is not None:
+        raise warn(
+            "The `condition` argument is deprecated. "
+            "You can pass condition data as additonal data arrays.",
+            DeprecationWarning,
+        )
+        data = (*data, condition)
     data = tuple(jnp.asarray(a) for a in data)
 
     if loss_fn is None:
@@ -135,7 +158,8 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, paramax.NonTrainable),
     )
     best_params = params
-    opt_state = optimizer.init(params)
+    if opt_state is None:
+        opt_state = optimizer.init(params)
 
     # train val split
     key, subkey = jr.split(key)
@@ -184,4 +208,8 @@ def fit_to_data(
 
     params = best_params if return_best else params
     dist = eqx.combine(params, static)
+
+    if return_opt_state:
+        return dist, losses, opt_state
+
     return dist, losses
